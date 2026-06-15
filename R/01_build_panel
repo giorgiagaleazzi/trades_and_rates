@@ -1,0 +1,592 @@
+# ============================================================
+# 01_build_panel.R
+#
+#  Galeazzi (2026) — "Why Do Exchange Rate Movements Often
+#  Fail to Generate Trade Adjustment?"
+#
+#  Builds a bilateral annual panel (1995-2023) ready for
+#  gravity estimation with persistent/transitory REER
+#  components and GPR interaction.
+#
+#  Output: panel_final.rds and panel_final.csv
+# ============================================================
+
+# ============================================================
+# SECTION 0 — SETUP
+# ============================================================
+
+Sys.setenv(http_proxy = "", https_proxy = "",
+           HTTP_PROXY = "", HTTPS_PROXY = "")
+
+YEAR_MIN <- as.integer(format(SAMPLE_START, "%Y"))
+YEAR_MAX <- as.integer(format(SAMPLE_END,   "%Y"))
+
+dir.create(file.path(RAW_DIR, "bis"), recursive = TRUE, showWarnings = FALSE)
+
+# Country codes per source convention
+g10_imf3 <- c("USA","GBR","CAN","JPN","AUS","NZL","CHE","SWE","NOR","EMU")  # IMTS (ISO-3)
+g10_bis  <- c("US","GB","CA","JP","AU","NZ","CH","SE","NO","XM")            # BIS (ISO-2)
+
+
+# ============================================================
+# SECTION 1 — IMF IMTS (formerly DOTS): BILATERAL EXPORTS
+# ============================================================
+#
+#  Manual download required (see chat history for steps).
+#  File: data/IMTS.csv, "Observation per row" + "ID" metadata.
+#  Columns are ISO-3 (COUNTRY.ID, COUNTERPART_COUNTRY.ID),
+#  TIME_PERIOD is "YYYY-Mxx" (monthly), indicator XG_FOB_USD.
+
+#imts_path <- "data/IMTS.csv"
+#stopifnot("IMTS.csv not found — download it first" = file.exists(imts_path))
+
+#dots_raw <- read_csv(imts_path, show_col_types = FALSE)
+
+dots <- dots_raw |>
+  rename(
+    reporter  = COUNTRY.ID,
+    partner   = COUNTERPART_COUNTRY.ID,
+    indicator = INDICATOR.ID,
+    time      = TIME_PERIOD,
+    exports   = OBS_VALUE
+  ) |>
+  filter(indicator == "XG_FOB_USD") |>
+  mutate(
+    year    = as.integer(str_sub(time, 1, 4)),
+    exports = as.numeric(exports)
+  ) |>
+  filter(
+    reporter %in% g10_imf3,
+    partner  %in% g10_imf3,
+    reporter != partner,
+    !is.na(exports), exports > 0,
+    year >= YEAR_MIN, year <= YEAR_MAX
+  ) |>
+  # collapse monthly obs to annual totals
+  group_by(reporter, partner, year) |>
+  summarise(exports = sum(exports, na.rm = TRUE), .groups = "drop") |>
+  mutate(ln_exports = log(exports))
+
+message(sprintf("IMTS: %d bilateral-year obs, %d pairs",
+                nrow(dots),
+                n_distinct(paste(dots$reporter, dots$partner))))
+
+
+# ============================================================
+# SECTION 2 — BIS REER (monthly, CPI-based, narrow basket)
+# ============================================================
+#
+#  Direct CSV export from the BIS Data Portal. Series key:
+#  M.R.N.<ISO2> (Monthly . Real . Narrow basket . country).
+#  Falls back to local files in data/bis/ if download fails.
+
+fetch_bis_reer <- function(iso2, save_dir = "data/bis") {
+
+  local_path <- file.path(save_dir, paste0("bis_reer_", iso2, ".csv"))
+
+  if (!file.exists(local_path)) {
+    url <- sprintf(
+      paste0("https://data.bis.org/topics/EER/BIS,WS_EER,1.0/M.R.N.%s",
+             "?file_format=csv&format=long&include=code%%2Clabel"),
+      iso2
+    )
+    message("    downloading: ", url)
+    txt <- request(url) |>
+      req_user_agent("Mozilla/5.0 (research; R httr2)") |>
+      req_timeout(60) |>
+      req_retry(max_tries = 3) |>
+      req_perform() |>
+      resp_body_string()
+    write_lines(txt, local_path)
+  }
+
+  lines      <- read_lines(local_path)
+  header_row <- which(str_detect(lines, "^DATAFLOW_ID"))[1]
+
+  read_csv(local_path, skip = header_row - 1, show_col_types = FALSE) |>
+    rename_with(~ str_remove(.x, ":.*$")) |>
+    transmute(
+      iso2 = str_remove(REF_AREA, ":.*$"),
+      date = floor_date(as.Date(TIME_PERIOD), "month"),
+      reer = as.numeric(OBS_VALUE)
+    ) |>
+    filter(!is.na(reer), !is.na(date))
+}
+
+message("Downloading / reading BIS REERs...")
+bis <- map_dfr(g10_bis, function(c) {
+  message("  Currency: ", c)
+  res <- fetch_bis_reer(c)
+  Sys.sleep(0.5)
+  res
+})
+
+message(sprintf("BIS: %d monthly obs across %d currencies",
+                nrow(bis), n_distinct(bis$iso2)))
+
+if (n_distinct(bis$iso2) < length(g10_bis)) {
+  missing <- setdiff(g10_bis, unique(bis$iso2))
+  message("Missing currencies — download these in a browser, save to data/bis/:")
+  for (c in missing) message(sprintf(
+    "  https://data.bis.org/topics/EER/BIS,WS_EER,1.0/M.R.N.%s?file_format=csv&format=long&include=code%%2Clabel  ->  bis_reer_%s.csv",
+    c, c))
+}
+
+
+# ============================================================
+# SECTION 3 — GPR INDEX (Caldara-Iacoviello)
+# ============================================================
+
+gpr_path <- "data/gpr.xls"
+
+if (!file.exists(gpr_path)) {
+  message("Downloading GPR index...")
+  tryCatch(
+    download.file(
+      "https://www.matteoiacoviello.com/gpr_files/data_gpr_export.xls",
+      gpr_path, mode = "wb"
+    ),
+    error = function(e) stop(
+      "GPR download failed. Download manually from\n",
+      "  https://www.matteoiacoviello.com/gpr.htm\n",
+      "and save as data/gpr.xls"
+    )
+  )
+}
+
+gpr_raw <- read_excel(gpr_path, guess_max = 10000)
+
+# File has a monthly "month" date column and "GPR" level column.
+gpr <- gpr_raw |>
+  rename_with(tolower) |>
+  rename(date_raw = month) |>
+  mutate(
+    date = if (inherits(date_raw, "Date") || inherits(date_raw, "POSIXct")) {
+      as.Date(date_raw)
+    } else if (is.numeric(date_raw)) {
+      as.Date(date_raw, origin = "1899-12-30")
+    } else {
+      as.Date(paste0(date_raw, "-01"))
+    }
+  ) |>
+  select(date, gpr, gprt) |>
+  mutate(gpr = as.numeric(gpr), gprt = as.numeric(gprt)) |>
+  filter(!is.na(date), !is.na(gpr))
+
+message(sprintf("GPR: %d monthly obs (%s to %s)",
+                nrow(gpr), min(gpr$date), max(gpr$date)))
+
+
+# ============================================================
+# SECTION 4 — REER DECOMPOSITION (CF, HP, Hamilton)
+# ============================================================
+#
+#  Three decomposition methods applied per currency, per
+#  cfg$decomposition (DECOMP_METHODS, CF_LOW_PERIOD/CF_HIGH_PERIOD,
+#  HP_LAMBDA, USE_HAMILTON/HAMILTON_H/HAMILTON_P):
+#
+#   - CF (Christiano-Fitzgerald band-pass, asymmetric):
+#       persistent = trend (cycles > CF_HIGH_PERIOD months)
+#       transitory = cycle (CF_LOW_PERIOD-CF_HIGH_PERIOD months)
+#
+#   - HP (Hodrick-Prescott, lambda = HP_LAMBDA):
+#       persistent = trend; transitory = cycle
+#
+#   - Hamilton (2018) regression filter (h = HAMILTON_H,
+#     p = HAMILTON_P lags starting at lag h):
+#       persistent = fitted value (predictable component);
+#       transitory = residual
+#
+#  CF remains the primary decomposition used to build
+#  q_persistent/q_transitory in panel_final (Section 5). HP and
+#  Hamilton produce additional bilateral differential columns
+#  (q_persistent_hp/q_transitory_hp,
+#   q_persistent_hamilton/q_transitory_hamilton) for the
+#  "alternative decomposition methods" robustness check.
+
+message("Applying REER decompositions: ", paste(DECOMP_METHODS, collapse = ", "))
+
+apply_cf_filter <- function(df, pl = CF_LOW_PERIOD, pu = CF_HIGH_PERIOD) {
+  df <- arrange(df, date)
+  cf <- cffilter(df$reer, pl = pl, pu = pu,
+                 root = FALSE, type = "asymmetric")
+  df |>
+    mutate(
+      reer_persistent_cf = as.numeric(cf$trend),
+      reer_transitory_cf = as.numeric(cf$cycle)
+    )
+}
+
+apply_hp_filter <- function(df, lambda = HP_LAMBDA) {
+  df <- arrange(df, date)
+  hp <- hpfilter(df$reer, freq = lambda, type = "lambda")
+  df |>
+    mutate(
+      reer_persistent_hp = as.numeric(hp$trend),
+      reer_transitory_hp = as.numeric(hp$cycle)
+    )
+}
+
+# Hamilton (2018) regression filter via deseats::hamilton_filter.
+# Returns @decomp (mts, S4 slot) with the original series, fitted
+# (trend) and rest (cycle) components. First (h+p-1) observations
+# are NA (insufficient lagged history).
+apply_hamilton_filter <- function(df, h = HAMILTON_H, p = HAMILTON_P) {
+  df <- arrange(df, date)
+  
+  yt  <- ts(df$reer, frequency = 12)  # monthly series
+  est <- deseats::hamilton_filter(yt, h = h, p = p)
+  
+  decomp <- as.data.frame(est@decomp)
+  
+  # decomp columns: "Observations", "Fitted" (trend), "Rest" (cycle)
+  trend <- as.numeric(decomp[["Fitted"]])
+  cycle <- as.numeric(decomp[["Rest"]])
+  
+  df |>
+    mutate(
+      reer_persistent_hamilton = trend,
+      reer_transitory_hamilton = cycle
+    )
+}
+
+
+# Apply REER decomposition filters (CF, HP, Hamilton) per currency
+bis_decomposed <- bis |>
+  group_by(iso2) |>
+  group_modify(~ {
+    out <- .x |> apply_cf_filter()
+    if (HP_LAMBDA > 0) out <- out |> apply_hp_filter()
+    if (isTRUE(USE_HAMILTON)) out <- out |> apply_hamilton_filter()
+    out
+  }) |>
+  ungroup()
+
+# Annual aggregation: simple within-year means of monthly levels
+# and decomposition components. NA-safe (Hamilton has NAs at the
+# start of each series; na.rm drops them from the annual mean).
+agg_cols <- intersect(
+  c("reer_persistent_cf", "reer_transitory_cf",
+    "reer_persistent_hp", "reer_transitory_hp",
+    "reer_persistent_hamilton", "reer_transitory_hamilton"),
+  names(bis_decomposed)
+)
+
+have_hp <- "reer_persistent_hp" %in% agg_cols
+have_hm <- "reer_persistent_hamilton" %in% agg_cols
+
+bis_annual <- bis_decomposed |>
+  mutate(year = year(date)) |>
+  filter(year >= YEAR_MIN, year <= YEAR_MAX) |>
+  group_by(iso2, year) |>
+  summarise(
+    reer = mean(reer, na.rm = TRUE),
+    across(all_of(agg_cols), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) |>
+  mutate(
+    # --- CF (primary) ---
+    ln_reer_persistent = log(pmax(reer_persistent_cf, 1e-6)),
+    reer_transitory_pc = reer_transitory_cf / reer
+  )
+
+if (have_hp) {
+  bis_annual <- bis_annual |>
+    mutate(
+      ln_reer_persistent_hp = log(pmax(reer_persistent_hp, 1e-6)),
+      reer_transitory_pc_hp = reer_transitory_hp / reer
+    )
+}
+
+if (have_hm) {
+  bis_annual <- bis_annual |>
+    mutate(
+      ln_reer_persistent_hm = log(pmax(reer_persistent_hamilton, 1e-6)),
+      reer_transitory_pc_hm = reer_transitory_hamilton / reer
+    )
+}
+
+message(sprintf("BIS annual: %d obs after decomposition (%s)",
+                nrow(bis_annual), paste(DECOMP_METHODS, collapse = ", ")))
+
+
+# ============================================================
+# SECTION 5 — BILATERAL REER COMPONENTS + MERGE ONTO PANEL
+# ============================================================
+#
+#  For each decomposition method m in {cf, hp, hamilton}:
+#    q^P_ij(m) = ln REER^P_i(m) - ln REER^P_j(m)
+#    q^T_ij(m) = transitory deviation of i(m) - that of j(m)
+#
+#  CF columns are unsuffixed (q_persistent, q_transitory) and
+#  remain the primary decomposition for the main specifications.
+#  HP/Hamilton produce suffixed columns (q_persistent_hp,
+#  q_persistent_hamilton, etc.) for the "alternative
+#  decomposition methods" robustness check.
+#
+#  Crosswalk: BIS "XM" (euro area) <-> IMTS "EMU".
+
+bis_to_imf3 <- c("US" = "USA", "GB" = "GBR", "CA" = "CAN",
+                 "JP" = "JPN", "AU" = "AUS", "NZ" = "NZL",
+                 "CH" = "CHE", "SE" = "SWE", "NO" = "NOR",
+                 "XM" = "EMU")
+
+bis_imf <- bis_annual |>
+  mutate(iso3 = recode(iso2, !!!bis_to_imf3))
+
+# Map of decomposition methods -> (persistent col, transitory col, output suffix)
+decomp_map <- list(
+  cf = list(p = "ln_reer_persistent",    t = "reer_transitory_pc",    suffix = ""),
+  hp = list(p = "ln_reer_persistent_hp", t = "reer_transitory_pc_hp", suffix = "_hp"),
+  hm = list(p = "ln_reer_persistent_hm", t = "reer_transitory_pc_hm", suffix = "_hamilton")
+)
+
+panel <- dots
+
+for (m in names(decomp_map)) {
+  spec <- decomp_map[[m]]
+  if (!all(c(spec$p, spec$t) %in% names(bis_imf))) next  # method not computed
+  
+  rep_cols <- bis_imf |>
+    select(iso3, year,
+           !!paste0("lnP_rep", spec$suffix) := all_of(spec$p),
+           !!paste0("qT_rep",  spec$suffix) := all_of(spec$t))
+  
+  par_cols <- bis_imf |>
+    select(iso3, year,
+           !!paste0("lnP_par", spec$suffix) := all_of(spec$p),
+           !!paste0("qT_par",  spec$suffix) := all_of(spec$t))
+  
+  panel <- panel |>
+    left_join(rep_cols, by = c("reporter" = "iso3", "year")) |>
+    left_join(par_cols, by = c("partner"  = "iso3", "year"))
+  
+  lnP_rep_col <- paste0("lnP_rep", spec$suffix)
+  lnP_par_col <- paste0("lnP_par", spec$suffix)
+  qT_rep_col  <- paste0("qT_rep",  spec$suffix)
+  qT_par_col  <- paste0("qT_par",  spec$suffix)
+  
+  q_p_col <- paste0("q_persistent", spec$suffix)
+  q_t_col <- paste0("q_transitory", spec$suffix)
+  
+  panel <- panel |>
+    mutate(
+      !!q_p_col := .data[[lnP_rep_col]] - .data[[lnP_par_col]],
+      !!q_t_col := .data[[qT_rep_col]]  - .data[[qT_par_col]]
+    ) |>
+    select(-all_of(c(lnP_rep_col, lnP_par_col, qT_rep_col, qT_par_col)))
+  
+  message(sprintf("  Merged %s decomposition -> %s, %s (%d missing)",
+                  toupper(m), q_p_col, q_t_col, sum(is.na(panel[[q_p_col]]))))
+}
+
+message(sprintf("Panel after REER merge: %d obs, %d missing q_persistent",
+                nrow(panel), sum(is.na(panel$q_persistent))))
+
+# ── Lagged REER differentials (TRADE_LAG_MONTHS = 12 → 1 year) ──
+panel <- panel |>
+  arrange(reporter, partner, year) |>
+  group_by(reporter, partner) |>
+  mutate(
+    q_persistent_lag = lag(q_persistent, 1),
+    q_transitory_lag = lag(q_transitory, 1)
+  ) |>
+  ungroup()
+
+message(sprintf("Added lagged REER differentials (1-year lag): %d missing (first year per pair)",
+                sum(is.na(panel$q_persistent_lag))))
+
+# ============================================================
+# SECTION 6 — MERGE GPR (annual average + high-GPR dummy)
+# ============================================================
+
+gpr_annual <- gpr |>
+  mutate(year = year(date)) |>
+  filter(year >= YEAR_MIN, year <= YEAR_MAX) |>
+  group_by(year) |>
+  summarise(
+    gpr  = mean(gpr,  na.rm = TRUE),
+    gprt = mean(gprt, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    ln_gpr  = log(gpr),
+    ln_gprt = log(gprt),
+    gpr_hi  = as.integer(gpr > quantile(gpr, 0.75))
+  )
+
+panel <- panel |> left_join(gpr_annual, by = "year")
+
+message(sprintf("Panel after GPR merge: %d missing gpr", sum(is.na(panel$gpr))))
+
+
+# ============================================================
+# SECTION 7 — CEPII GEODIST (gravity controls) + MERGE
+# ============================================================
+#
+#  CEPII has no entry for "EMU" (euro area is an IMF/BIS
+#  aggregate, not a CEPII territory). Synthetic EMU gravity
+#  controls are constructed as averages across core euro-area
+#  members (DEU, FRA, ITA, ESP, NLD).
+#
+#  Set CONSTRUCT_EMU_GEODIST <- FALSE to drop EMU pairs from
+#  gravity-control specs instead (they remain in pair-FE specs,
+#  where time-invariant controls are absorbed anyway).
+
+CONSTRUCT_EMU_GEODIST <- TRUE
+emu_proxy_members <- c("DEU", "FRA", "ITA", "ESP", "NLD")
+
+cepii_xls <- "data/dist_cepii.xls"
+stopifnot("dist_cepii.xls not found in data/" = file.exists(cepii_xls))
+
+geodist_raw <- read_excel(cepii_xls) |>
+  select(iso_o, iso_d, distw, contig, comlang_off, colony, comcol) |>
+  rename(
+    reporter_iso3 = iso_o,
+    partner_iso3  = iso_d,
+    dist          = distw
+  ) |>
+  mutate(dist = as.numeric(dist)) |>
+  filter(!is.na(dist), reporter_iso3 != partner_iso3)
+
+message(sprintf("GeoDist (raw, cleaned): %d country pairs", nrow(geodist_raw)))
+
+geodist_g10 <- geodist_raw |>
+  filter(reporter_iso3 %in% g10_imf3, partner_iso3 %in% g10_imf3)
+
+message(sprintf("GeoDist (G10 pairs): %d", nrow(geodist_g10)))
+
+if (CONSTRUCT_EMU_GEODIST) {
+  
+  other_g10 <- setdiff(g10_imf3, "EMU")
+  
+  emu_as_reporter <- geodist_raw |>
+    filter(reporter_iso3 %in% emu_proxy_members,
+           partner_iso3  %in% other_g10) |>
+    group_by(partner_iso3) |>
+    summarise(
+      dist        = mean(dist, na.rm = TRUE),
+      contig      = as.integer(any(contig == 1)),
+      comlang_off = as.integer(any(comlang_off == 1)),
+      colony      = as.integer(any(colony == 1)),
+      comcol      = as.integer(any(comcol == 1)),
+      .groups = "drop"
+    ) |>
+    mutate(reporter_iso3 = "EMU") |>
+    select(reporter_iso3, partner_iso3, dist, contig, comlang_off, colony, comcol)
+  
+  emu_as_partner <- geodist_raw |>
+    filter(partner_iso3  %in% emu_proxy_members,
+           reporter_iso3 %in% other_g10) |>
+    group_by(reporter_iso3) |>
+    summarise(
+      dist        = mean(dist, na.rm = TRUE),
+      contig      = as.integer(any(contig == 1)),
+      comlang_off = as.integer(any(comlang_off == 1)),
+      colony      = as.integer(any(colony == 1)),
+      comcol      = as.integer(any(comcol == 1)),
+      .groups = "drop"
+    ) |>
+    mutate(partner_iso3 = "EMU") |>
+    select(reporter_iso3, partner_iso3, dist, contig, comlang_off, colony, comcol)
+  
+  geodist_g10 <- bind_rows(geodist_g10, emu_as_reporter, emu_as_partner)
+  
+  message(sprintf("GeoDist (G10 pairs incl. synthetic EMU): %d", nrow(geodist_g10)))
+}
+
+geodist_g10 <- geodist_g10 |> mutate(ln_dist = log(dist))
+
+panel <- panel |>
+  left_join(geodist_g10, by = c("reporter" = "reporter_iso3",
+                                "partner"  = "partner_iso3"))
+
+n_missing_dist <- sum(is.na(panel$dist))
+message(sprintf("Panel after geodist merge: %d obs, %d missing dist",
+                nrow(panel), n_missing_dist))
+
+if (n_missing_dist > 0) {
+  print(panel |> filter(is.na(dist)) |> distinct(reporter, partner))
+  warning(sprintf("%d obs have missing gravity controls (pairs above).",
+                  n_missing_dist))
+}
+
+
+# ============================================================
+# SECTION 8 — PANEL IDENTIFIERS AND CLEANING
+# ============================================================
+
+panel <- panel |>
+  mutate(
+    pair_id = paste(reporter, partner, sep = "_"),
+    year_id = factor(year)
+  )
+
+message("\n-- Panel summary -----------------------------------")
+message(sprintf("Obs                 : %d", nrow(panel)))
+message(sprintf("Country pairs       : %d", n_distinct(panel$pair_id)))
+message(sprintf("Years               : %d-%d", min(panel$year), max(panel$year)))
+message(sprintf("Missing q_persistent: %d", sum(is.na(panel$q_persistent))))
+message(sprintf("Missing gpr         : %d", sum(is.na(panel$gpr))))
+message(sprintf("Missing ln_dist     : %d", sum(is.na(panel$ln_dist))))
+
+# Core sample for FE estimation (gravity controls absorbed by pair FE)
+core_vars <- c("ln_exports", "q_persistent", "q_transitory", "gpr")
+
+panel_clean <- panel |>
+  filter(if_all(all_of(core_vars), ~ !is.na(.x)))
+
+message(sprintf("\nClean panel obs     : %d (%.1f%% retained)",
+                nrow(panel_clean),
+                100 * nrow(panel_clean) / nrow(panel)))
+
+
+# ============================================================
+# SECTION 9 — QUICK ESTIMATION CHECK (fixest)
+# ============================================================
+#
+#  Eq. 5.2 (baseline):
+#    ln X_ijt = b1 q^P_ijt + b2 q^T_ijt + mu_ij + lambda_t + e
+#  Eq. 5.3 (GPR interaction):
+#    adds b2' (q^P x ln GPR_t). ln_gpr main effect is absorbed
+#    by year FE; only the interaction is identified.
+
+message("\n-- Baseline gravity (pair + year FE) ---------------")
+m_baseline <- feols(
+  ln_exports ~ q_persistent + q_transitory | pair_id + year_id,
+  data = panel_clean, cluster = ~pair_id
+)
+print(summary(m_baseline))
+
+message("\n-- GPR interaction spec -----------------------------")
+m_gpr <- feols(
+  ln_exports ~ q_persistent + q_persistent:ln_gpr + q_transitory |
+    pair_id + year_id,
+  data = panel_clean, cluster = ~pair_id
+)
+print(summary(m_gpr))
+
+# Cross-sectional check with explicit gravity controls (no pair FE)
+message("\n-- Cross-sectional check with gravity controls -------")
+m_cs <- feols(
+  ln_exports ~ q_persistent + q_transitory
+  + ln_dist + contig + comlang_off + colony | year_id,
+  data = panel_clean |> filter(!is.na(ln_dist)),
+  cluster = ~pair_id
+)
+print(summary(m_cs))
+
+
+# ============================================================
+# SECTION 10 — SAVE OUTPUT
+# ============================================================
+
+out_rds <- file.path(CLEAN_DIR, "panel_final.rds")
+out_csv <- file.path(CLEAN_DIR, "panel_final.csv")
+
+saveRDS(panel_clean, out_rds)
+write_csv(panel_clean, out_csv)
+
+message("\nSaved: panel_final.rds and panel_final.csv")
+message("Variables:")
+message(paste(" ", names(panel_clean), collapse = "\n"))
